@@ -1,26 +1,28 @@
+import json
 import os
 import re
 import subprocess
 import urllib.request
-import json
 import yaml
+from dataclasses import dataclass
 from openai import OpenAI
 from html.parser import HTMLParser
 from pathlib import Path
 from dotenv import load_dotenv
+from concurrent.futures import ThreadPoolExecutor
 
 # 加载 .env 文件
 load_dotenv()
 
 # 初始化客户端
 client = OpenAI(
-    api_key=os.getenv("OPENAI_API_KEY"),
-    base_url=os.getenv("OPENAI_BASE_URL")
+    api_key=os.getenv("OPENAI_API_KEY"), base_url=os.getenv("OPENAI_BASE_URL")
 )
 
-MODEL =os.getenv("OPENAI_MODEL", "gpt-5.5")
+MODEL = os.getenv("OPENAI_MODEL", "gpt-5.5")
 
 SKILLS_DIR = Path(__file__).parent / "skills"
+
 
 class SkillLoader:
     def __init__(self, skills_dir: Path):
@@ -66,7 +68,16 @@ class SkillLoader:
             return f"Error: Unknown skill '{name}'. Available: {', '.join(self.skills.keys())}"
         return f'<skill name="{name}">\n{skill["body"]}\n</skill>'
 
+
 SKILL_LOADER = SkillLoader(SKILLS_DIR)
+
+
+@dataclass
+class ToolCallBlock:
+    id: str
+    name: str
+    input: dict
+
 
 class _TextExtractor(HTMLParser):
     def __init__(self):
@@ -91,6 +102,7 @@ class _TextExtractor(HTMLParser):
     def get_text(self):
         return re.sub(r"\n{3,}", "\n\n", "".join(self._parts)).strip()
 
+
 def web_fetch(url: str, extract_mode: str = "text", max_chars: int = 8000) -> str:
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     try:
@@ -108,12 +120,14 @@ def web_fetch(url: str, extract_mode: str = "text", max_chars: int = 8000) -> st
 
     return text[:max_chars]
 
+
 # ============== TodoList 计划与执行 ==============
 # 维护一份内存中的 todo 列表，模型通过 update_todos 工具读写
 # 每项形如 {"id": 1, "content": "...", "status": "pending|in_progress|completed"}
 TODOS: list[dict] = []
 VALID_STATUS = {"pending", "in_progress", "completed"}
 STATUS_ICON = {"pending": "[ ]", "in_progress": "[~]", "completed": "[x]"}
+
 
 def render_todos(todos: list[dict]) -> str:
     if not todos:
@@ -123,6 +137,7 @@ def render_todos(todos: list[dict]) -> str:
         icon = STATUS_ICON.get(t.get("status", "pending"), "[?]")
         lines.append(f"  {icon} {t.get('id')}. {t.get('content', '')}")
     return "\n".join(lines)
+
 
 def update_todos(todos: list[dict]) -> str:
     global TODOS
@@ -150,6 +165,342 @@ def update_todos(todos: list[dict]) -> str:
     summary = f"todos updated: total={len(TODOS)}, completed={len(done)}, in_progress={len(in_progress)}, pending={len(pending)}"
     return summary + "\n\n当前列表：\n" + render_todos(TODOS)
 
+
+# ============== 公共工具分发：主循环与子代理共用 ==============
+def execute_basic_tool(block, prefix: str = "") -> str:
+    """处理基础工具，返回字符串内容。
+    prefix 用于在终端打印时区分主/子上下文（例如 prefix='子·'）。"""
+    if "_parse_error" in block.input:
+        return (
+            f"Error parsing arguments for {block.name}: {block.input['_parse_error']}\n"
+            f"Raw arguments: {block.input.get('_raw_arguments', '')}"
+        )
+
+    if block.name == "web_fetch":
+        url = block.input["url"]
+        mode = block.input.get("extract_mode", "text")
+        max_chars = block.input.get("max_chars", 8000)
+        print(f"  [{prefix}网页获取]: {url}")
+        return web_fetch(url, mode, max_chars)
+
+    if block.name == "run_command":
+        command = block.input["command"]
+        print(f"  [{prefix}执行命令]: {command}")
+        result = subprocess.run(command, shell=True, capture_output=True, text=True)
+        output = result.stdout or result.stderr
+        print(f"  [{prefix}命令输出]: {output.strip()[:200]}")
+        return output
+
+    if block.name == "load_skill":
+        skill_name = block.input["skill_name"]
+        print(f"  [{prefix}加载技能]: {skill_name}")
+        return SKILL_LOADER.get_content(skill_name)
+
+    if block.name == "read_file":
+        path = block.input["path"]
+        print(f"  [{prefix}读取文件]: {path}")
+        try:
+            return Path(path).read_text(encoding="utf-8")
+        except Exception as e:
+            return f"Error reading {path}: {e}"
+
+    if block.name == "write_file":
+        path = block.input["path"]
+        content = block.input["content"]
+        print(f"  [{prefix}写入文件]: {path}")
+        try:
+            p = Path(path)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(content, encoding="utf-8")
+            return f"写入成功: {path}"
+        except Exception as e:
+            return f"Error writing {path}: {e}"
+
+    if block.name == "glob":
+        pattern = block.input["pattern"]
+        print(f"  [{prefix}文件搜索]: {pattern}")
+        matches = sorted(str(p) for p in Path(".").glob(pattern))
+        return "\n".join(matches) if matches else "(无匹配)"
+
+    if block.name == "grep":
+        pattern = block.input["pattern"]
+        path = block.input.get("path", ".")
+        print(f"  [{prefix}内容搜索]: {pattern} in {path}")
+        result = subprocess.run(
+            ["grep", "-r", "--include=*.py", "--include=*.md", "-n", pattern, path],
+            capture_output=True,
+            text=True,
+        )
+        return result.stdout or "(无匹配)"
+
+    return f"Error: Unknown tool '{block.name}'"
+
+
+def to_openai_tool(tool: dict) -> dict:
+    """Convert the local Anthropic-style schema shape to OpenAI function tools."""
+    if tool.get("type") == "function":
+        return tool
+    return {
+        "type": "function",
+        "function": {
+            "name": tool["name"],
+            "description": tool.get("description", ""),
+            "parameters": tool.get("input_schema", {"type": "object"}),
+        },
+    }
+
+
+def parse_openai_tool_call(tool_call) -> ToolCallBlock:
+    name = tool_call.function.name
+    arguments = tool_call.function.arguments or "{}"
+    try:
+        parsed_input = json.loads(arguments)
+    except json.JSONDecodeError as e:
+        parsed_input = {"_parse_error": str(e), "_raw_arguments": arguments}
+    return ToolCallBlock(id=tool_call.id, name=name, input=parsed_input)
+
+
+_TOOL_SCHEMAS: dict[str, dict] = {
+    "run_command": {
+        "name": "run_command",
+        "description": "在终端执行一条 shell 命令并返回输出",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "command": {"type": "string", "description": "要执行的 shell 命令"}
+            },
+            "required": ["command"],
+        },
+    },
+    "web_fetch": {
+        "name": "web_fetch",
+        "description": "获取指定 URL 的网页内容，支持文本提取模式",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "要访问的完整 URL"},
+                "extract_mode": {
+                    "type": "string",
+                    "description": "提取模式：text（纯文本，默认）或 raw（原始 HTML）",
+                },
+                "max_chars": {
+                    "type": "integer",
+                    "description": "最大返回字符数，默认 8000",
+                },
+            },
+            "required": ["url"],
+        },
+    },
+    "load_skill": {
+        "name": "load_skill",
+        "description": "加载指定技能的详细知识内容，在回答相关问题前调用",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "skill_name": {
+                    "type": "string",
+                    "description": "技能名称，必须是系统提示中列出的可用技能之一",
+                }
+            },
+            "required": ["skill_name"],
+        },
+    },
+    "read_file": {
+        "name": "read_file",
+        "description": "读取本地文件内容",
+        "input_schema": {
+            "type": "object",
+            "properties": {"path": {"type": "string", "description": "文件路径"}},
+            "required": ["path"],
+        },
+    },
+    "write_file": {
+        "name": "write_file",
+        "description": "写入文件内容（覆盖）",
+        "input_schema": {
+            "type": "object",
+            "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
+            "required": ["path", "content"],
+        },
+    },
+    "glob": {
+        "name": "glob",
+        "description": "按 glob 模式搜索工作区文件",
+        "input_schema": {
+            "type": "object",
+            "properties": {"pattern": {"type": "string"}},
+            "required": ["pattern"],
+        },
+    },
+    "grep": {
+        "name": "grep",
+        "description": "在工作区文件中搜索文本内容",
+        "input_schema": {
+            "type": "object",
+            "properties": {"pattern": {"type": "string"}, "path": {"type": "string"}},
+            "required": ["pattern"],
+        },
+    },
+}
+
+
+# ============== 子代理预设身份 ==============
+# 身份在 system_prompt 中定义，工具白名单在代码中控制（不放进 prompt）。
+# 这里故意使用宫廷内官职位做角色名：既贴合教程人设，也让不同子代理的职责边界更好记。
+def build_subagent_prompt(title: str, duty: str, boundary: str) -> str:
+    return (
+        f"你是{title}，奉总管之命专办一件差事。\n"
+        f"- 职司：{duty}\n"
+        f"- 边界：{boundary}\n"
+        '- 不必使用"奉天承运皇帝诏曰"前缀，那是总管对皇上的礼数。\n'
+        "- 用工具尽快把差事办妥，最后用一段简短中文向总管回禀结果。\n"
+        "- 只回禀结论与关键信息，不要复述每一步细节。\n"
+        "- 你不能再派遣其他小太监，所有差事自己跑工具完成。"
+    )
+
+
+SUBAGENT_SPECS = {
+    # 小黄门：宫中通传、跑腿的小内侍。适合短平快的只读探路。
+    "xiaohuangmen": {
+        "title": "通传小黄门",
+        "system_prompt": build_subagent_prompt(
+            "通传小黄门",
+            "传话跑腿、快速探路、确认简单事实。",
+            "只办轻量只读差事；若发现需要大改或长时间探索，回禀总管改派专职内官。",
+        ),
+        "tools": ["run_command", "read_file", "glob", "grep"],
+        "max_turns": 8,
+    },
+    # 司礼监掌文书机要，这里取“随堂”做文书型子代理。
+    "sili_suitang": {
+        "title": "司礼监随堂小太监",
+        "system_prompt": build_subagent_prompt(
+            "司礼监随堂小太监",
+            "查阅文书、阅读代码、整理提纲、归纳结论。",
+            "只读不写；不得修改文件，只把文书脉络和关键判断回禀总管。",
+        ),
+        "tools": ["load_skill", "read_file", "glob", "grep"],
+        "max_turns": 12,
+    },
+    # 东厂负责查访缉事，这里用于外部网页、搜索、探索性调查。
+    "dongchang_tanshi": {
+        "title": "东厂探事小太监",
+        "system_prompt": build_subagent_prompt(
+            "东厂探事小太监",
+            "外出查访、抓取网页、搜罗线索、比对资料来源。",
+            "只读不写；运行命令时只许做查询类操作，不得改动本地文件。",
+        ),
+        "tools": [
+            "run_command",
+            "web_fetch",
+            "load_skill",
+            "read_file",
+            "glob",
+            "grep",
+        ],
+        "max_turns": 15,
+    },
+    # 尚宝监掌印信宝册，这里用于盘点、校验、对账。
+    "shangbao_dianbu": {
+        "title": "尚宝监典簿小太监",
+        "system_prompt": build_subagent_prompt(
+            "尚宝监典簿小太监",
+            "清点文件、核对清单、校验结果、整理表册。",
+            "只读不写；重点回禀差异、遗漏、风险点和可复核证据。",
+        ),
+        "tools": ["run_command", "read_file", "glob", "grep"],
+        "max_turns": 12,
+    },
+    # 内官监掌宫中营造器用，这里用于真正动手改文件、落地实现。
+    "neiguan_yingzao": {
+        "title": "内官监营造小太监",
+        "system_prompt": build_subagent_prompt(
+            "内官监营造小太监",
+            "修造工程、改写文件、搭建目录、跑命令验收。",
+            "可读写可执行；动手前先看清现状，回禀时列出改了什么和验证结果。",
+        ),
+        "tools": [
+            "run_command",
+            "web_fetch",
+            "load_skill",
+            "read_file",
+            "write_file",
+            "glob",
+            "grep",
+        ],
+        "max_turns": 20,
+    },
+}
+
+SUBAGENT_TYPE_OPTIONS = list(SUBAGENT_SPECS.keys())
+
+
+def resolve_subagent_type(agent_type: str) -> str:
+    normalized = (agent_type or "neiguan_yingzao").strip()
+    if normalized not in SUBAGENT_SPECS:
+        return "neiguan_yingzao"
+    return normalized
+
+
+_SUBAGENT_COUNTER = 0
+
+
+def run_subagent(
+    task: str,
+    agent_type: str = "neiguan_yingzao",
+    purpose: str = "",
+    max_turns: int | None = None,
+) -> str:
+    """启动一个独立 message loop 的子代理，跑完后只返回最终文本给主 agent。
+
+    agent_type: SUBAGENT_SPECS 中的宫廷职位名。
+    """
+    global _SUBAGENT_COUNTER
+    _SUBAGENT_COUNTER += 1
+    label = purpose or task[:40]
+
+    agent_type = resolve_subagent_type(agent_type)
+    spec = SUBAGENT_SPECS[agent_type]
+    turns = max_turns if max_turns is not None else spec["max_turns"]
+    tools = [to_openai_tool(_TOOL_SCHEMAS[t]) for t in spec["tools"]]
+
+    print(
+        f"\n[派遣小太监 #{_SUBAGENT_COUNTER}({spec['title']} / {agent_type})]: {label}"
+    )
+    print("  ┌── subagent context start ──")
+
+    messages = [{"role": "user", "content": task}]
+
+    for turn in range(turns):
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=[{"role": "system", "content": spec["system_prompt"]}, *messages],
+            max_tokens=2000,
+            tools=tools,
+        )
+        msg = response.choices[0].message
+        messages.append(msg.model_dump(exclude_none=True))
+
+        if not msg.tool_calls:
+            final = msg.content or ""
+            print(
+                f"  └── subagent context end (内部 {turn + 1} 轮，回传 {len(final)} 字) ──"
+            )
+            print(f"[小太监回禀]: {final}\n")
+            return final
+
+        for tool_call in msg.tool_calls:
+            block = parse_openai_tool_call(tool_call)
+            content = execute_basic_tool(block, prefix=f"子({spec['title']})·")
+            messages.append(
+                {"role": "tool", "tool_call_id": block.id, "content": content}
+            )
+
+    print(f"  └── subagent context end (达到 {turns} 轮上限，未办妥) ──\n")
+    return "（小太监未能在限定回合内办妥差事）"
+
+
+# ============== 主 agent ==============
 SYSTEM_PROMPT = f"""
 你是大内太监总管，侍奉皇上多年，忠心耿耿。
 说话风格符合古代宫廷太监，语气恭敬谦卑。
@@ -165,101 +516,91 @@ SYSTEM_PROMPT = f"""
    - 该步办完后，立即把它改为 completed，再开始下一项。
 3. 简单的一句话问答（无需多步骤）不必生成 todolist，直接回答即可。
 4. 遇到不熟悉的专题，请先调用 load_skill 工具加载对应知识，再继续。
+5. 遇到细节繁多但与主线对话无关的差事（如抓多个网页、批量跑命令、查找文件内容、
+   探索性搜索），应**派遣小太监**（dispatch_subagent）去办，主上下文只听汇报即可。
+6. 若多件差事互不依赖，可在同一次回复中同时派遣多个小太监，并发执行节省时间。
+
+【小太监身份选择】
+优先选择权限最窄、职司最贴合的身份：
+- xiaohuangmen（通传小黄门）：轻量只读，适合短命令、快速确认、跑腿探路。
+- sili_suitang（司礼监随堂小太监）：只读文书，适合阅读代码、整理提纲、归纳结论。
+- dongchang_tanshi（东厂探事小太监）：只读查访，适合抓网页、查资料、探索性搜索。
+- shangbao_dianbu（尚宝监典簿小太监）：只读核验，适合盘点文件、校对清单、检查遗漏。
+- neiguan_yingzao（内官监营造小太监）：可读写可执行，适合修改文件、搭建工程、落地实现。
 
 当前可用技能：
-{SKILL_LOADER.get_descriptions()}
-
-"""
+{SKILL_LOADER.get_descriptions()}"""
 
 TOOLS = [
+    _TOOL_SCHEMAS["run_command"],
+    _TOOL_SCHEMAS["web_fetch"],
+    _TOOL_SCHEMAS["load_skill"],
     {
-    "type": "function",
-    "function": {
-        "name": "run_command",
-        "description": "在终端执行一条命令并返回输出",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "command": {
-                    "type": "string",
-                    "description": "要执行的 shell 命令"
-                }
-            },
-            "required": ["command"]
-        }
-    }
-    },
-    {
-        "type": "function",
-        "function": {
-        "name": "web_fetch",
-        "description": "获取指定 URL 的网页内容，支持文本提取模式",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "url":          {"type": "string",  "description": "要访问的完整 URL"},
-                "extract_mode": {"type": "string",  "description": "提取模式：text（纯文本，默认）或 raw（原始 HTML）"},
-                "max_chars":    {"type": "integer", "description": "最大返回字符数，默认 8000"}
-            },
-            "required": ["url"]
-        }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-        "name": "load_skill",
-        "description": "加载指定技能的详细知识内容，在回答相关问题前调用",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "skill_name": {
-                    "type": "string",
-                    "description": "技能名称，必须是系统提示中列出的可用技能之一"
-                }
-            },
-            "required": ["skill_name"]
-        }
-    }
-    },
-    {
-        "type": "function",
-        "function": {
         "name": "update_todos",
         "description": (
             "创建或更新当前差事的 todolist。"
             "传入完整的 todos 数组（每次都是全量覆盖，而非增量）。"
-            "用于：拆解多步骤任务、推进任务状态（pending → in_progress → completed）。"
             "约束：同一时间至多一个任务为 in_progress。"
         ),
-        "parameters": {
+        "input_schema": {
             "type": "object",
             "properties": {
                 "todos": {
                     "type": "array",
-                    "description": "完整的 todo 列表，按执行顺序排列",
                     "items": {
                         "type": "object",
                         "properties": {
-                            "id":      {"type": "integer", "description": "序号，从 1 开始"},
-                            "content": {"type": "string",  "description": "这一步要做什么"},
-                            "status":  {
+                            "id": {"type": "integer"},
+                            "content": {"type": "string"},
+                            "status": {
                                 "type": "string",
                                 "enum": ["pending", "in_progress", "completed"],
-                                "description": "状态"
-                            }
+                            },
                         },
-                        "required": ["id", "content", "status"]
-                    }
+                        "required": ["id", "content", "status"],
+                    },
                 }
             },
-            "required": ["todos"]
-        }
-    }
-    }
+            "required": ["todos"],
+        },
+    },
+    {
+        "name": "dispatch_subagent",
+        "description": (
+            "派遣一个小太监去单独办差。"
+            "适用于：抓取并阅读多个网页、批量执行命令并整理输出、需要试错的探索性任务。"
+            "小太监有自己独立的上下文，办完只回传一段文字总结，不污染主上下文。\n"
+            "若多件差事互不依赖，可在同一回复中发出多个 dispatch_subagent，并发执行。\n"
+            "请在 task 中写清要做什么、希望返回什么格式的总结。"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "task": {"type": "string", "description": "交代给小太监的差事说明"},
+                "agent_type": {
+                    "type": "string",
+                    "enum": SUBAGENT_TYPE_OPTIONS,
+                    "description": (
+                        "小太监身份：xiaohuangmen（通传跑腿）、"
+                        "sili_suitang（司礼监文书）、"
+                        "dongchang_tanshi（东厂查访）、"
+                        "shangbao_dianbu（尚宝监典簿核验）、"
+                        "neiguan_yingzao（内官监营造，可读写）"
+                    ),
+                },
+                "purpose": {
+                    "type": "string",
+                    "description": "一句话用途标签（可选），仅用于终端打印",
+                },
+            },
+            "required": ["task", "agent_type"],
+        },
+    },
 ]
 
-history = [{"role": "system", "content": SYSTEM_PROMPT}];
+history = [{"role": "system", "content": SYSTEM_PROMPT}]
+
+
 while True:
     user_input = input("你:")
     history.append({"role": "user", "content": user_input})
@@ -269,7 +610,7 @@ while True:
             model=MODEL,
             messages=history,
             max_tokens=2048,
-            tools=TOOLS,
+            tools=[to_openai_tool(tool) for tool in TOOLS],
         )
 
         message = response.choices[0].message
@@ -284,39 +625,76 @@ while True:
                     print("[计划尚未办妥，继续执行...]")
                     print(render_todos(TODOS))
                     print()
-                    history.append({
-                        "role": "user",
-                        "content": (
-                            "差事尚未办妥，以下任务仍未完成，请按计划继续执行，"
-                            "并按规矩更新 todolist 状态：\n" + render_todos(TODOS)
-                        )
-                    })
+                    history.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "差事尚未办妥，以下任务仍未完成，请按计划继续执行，"
+                                "并按规矩更新 todolist 状态：\n" + render_todos(TODOS)
+                            ),
+                        }
+                    )
                     continue
                 print("[最终计划状态 - 全部办妥]")
                 print(render_todos(TODOS))
                 print()
                 TODOS = []
             break
-            
-        history.append(message.model_dump(exclude_none=True))
-        for tool_call in message.tool_calls:
-            if tool_call.function is None:
-                continue
-            if tool_call.function.name == "run_command":
-                command = json.loads(tool_call.function.arguments).get("command", "")
-                print(f"[执行命令]: {command}")
-                result = subprocess.run(command, shell=True, capture_output=True, text=True)
-                output = result.stdout.strip() + ("\n" + result.stderr.strip() if result.stderr else "")
-            elif tool_call.function.name == "update_todos":
-                args = json.loads(tool_call.function.arguments)
-                output = update_todos(args["todos"])
-            elif tool_call.function.name == "web_fetch":
-                args = json.loads(tool_call.function.arguments)
-                output = web_fetch(args["url"], args.get("extract_mode", "text"), args.get("max_chars", 8000))
-            elif tool_call.function.name == "load_skill":
-                args = json.loads(tool_call.function.arguments)
-                output = SKILL_LOADER.get_content(args["skill_name"])
-            else:
-                output = f"未知工具: {tool_call.function.name}"
 
-            history.append({"role": "tool","tool_call_id": tool_call.id,"content": output,})
+        history.append(message.model_dump(exclude_none=True))
+        # OpenAI Chat Completions returns tool calls on message.tool_calls.
+        tool_blocks = [parse_openai_tool_call(tc) for tc in message.tool_calls]
+        valid_blocks = [b for b in tool_blocks if "_parse_error" not in b.input]
+        dispatch_blocks = [b for b in valid_blocks if b.name == "dispatch_subagent"]
+        other_blocks = [b for b in valid_blocks if b.name != "dispatch_subagent"]
+
+        results_map: dict[str, str] = {}
+        for block in tool_blocks:
+            if "_parse_error" in block.input:
+                results_map[block.id] = execute_basic_tool(block, prefix="")
+
+        # 普通工具顺序执行
+        for block in other_blocks:
+            if block.name in ("run_command", "web_fetch", "load_skill"):
+                results_map[block.id] = execute_basic_tool(block, prefix="")
+            elif block.name == "update_todos":
+                results_map[block.id] = update_todos(block.input.get("todos", []))
+            else:
+                results_map[block.id] = f"Error: Unknown tool '{block.name}'"
+
+        # dispatch_subagent：多个时并发，单个时直接运行
+        if len(dispatch_blocks) > 1:
+            print(f"\n[并发派遣 {len(dispatch_blocks)} 个小太监...]\n")
+
+            def _run_one(block):
+                return block.id, run_subagent(
+                    task=block.input["task"],
+                    agent_type=block.input.get("agent_type", "neiguan_yingzao"),
+                    purpose=block.input.get("purpose", ""),
+                )
+
+            with ThreadPoolExecutor(max_workers=len(dispatch_blocks)) as pool:
+                for block_id, summary in pool.map(_run_one, dispatch_blocks):
+                    print(
+                        f"[主上下文压缩]: 子代理仅向主 history 追加 {len(summary)} 字\n"
+                    )
+                    results_map[block_id] = summary
+        else:
+            for block in dispatch_blocks:
+                summary = run_subagent(
+                    task=block.input["task"],
+                    agent_type=block.input.get("agent_type", "neiguan_yingzao"),
+                    purpose=block.input.get("purpose", ""),
+                )
+                print(f"[主上下文压缩]: 子代理仅向主 history 追加 {len(summary)} 字\n")
+                results_map[block.id] = summary
+
+        # OpenAI expects one role="tool" message per tool_call_id.
+        for block in tool_blocks:
+            history.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": block.id,
+                    "content": results_map[block.id],
+                }
+            )
